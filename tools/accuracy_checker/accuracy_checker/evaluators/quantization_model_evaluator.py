@@ -83,7 +83,7 @@ class ModelEvaluator:
             if self.stat_collector:
                 self.stat_collector.process_batch(batch_predictions)
             if raw_outputs_callback:
-                raw_outputs_callback(batch_predictions)
+                raw_outputs_callback(batch_predictions, batch_identifiers=batch_identifiers, batch_meta=batch_meta)
             if adapter:
                 batch_predictions = self.adapter.process(batch_predictions, batch_identifiers, batch_meta)
 
