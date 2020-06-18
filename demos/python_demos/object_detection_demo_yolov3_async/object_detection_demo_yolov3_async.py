@@ -75,17 +75,20 @@ def build_argparser():
                       help='Optional. List of monitors to show initially.')
     args.add_argument("--keep_aspect_ratio", action="store_true", default=False,
                       help='Optional. Keeps aspect ratio on resize.')
+    args.add_argument("--is_trained_on_square_images_run_on_nonsquare", action="store_true", default=False,
+                      help='Optional. If the network was trained on square images and run on non-square.')
     return parser
 
 
 class YoloParams:
     # ------------------------------------------- Extracting layer parameters ------------------------------------------
     # Magic numbers are copied from yolo samples
-    def __init__(self, param, side):
+    def __init__(self, param, side_w, side_h):
         self.num = 3 if 'num' not in param else int(param['num'])
         self.coords = 4 if 'coords' not in param else int(param['coords'])
         self.classes = 80 if 'classes' not in param else int(param['classes'])
-        self.side = side
+        self.side_w = side_w
+        self.side_h = side_h
         self.anchors = [10.0, 13.0, 16.0, 30.0, 33.0, 23.0, 30.0, 61.0, 62.0, 45.0, 59.0, 119.0, 116.0, 90.0, 156.0,
                         198.0,
                         373.0, 326.0] if 'anchors' not in param else [float(a) for a in param['anchors'].split(',')]
@@ -143,21 +146,26 @@ def scale_bbox(x, y, height, width, class_id, confidence, im_h, im_w, is_proport
     return dict(xmin=xmin, xmax=xmax, ymin=ymin, ymax=ymax, class_id=class_id.item(), confidence=confidence.item())
 
 
-def parse_yolo_region(predictions, resized_image_shape, original_im_shape, params, threshold, is_proportional):
-    # ------------------------------------------ Validating output parameters ------------------------------------------
-    _, _, out_blob_h, out_blob_w = predictions.shape
-    assert out_blob_w == out_blob_h, "Invalid size of output blob. It sould be in NCHW layout and height should " \
-                                     "be equal to width. Current height = {}, current width = {}" \
-                                     "".format(out_blob_h, out_blob_w)
+def parse_yolo_region(predictions, resized_image_shape, original_im_shape, params, threshold, is_proportional,
+                      is_trained_on_square_images_run_on_nonsquare):
 
     # ------------------------------------------ Extracting layer parameters -------------------------------------------
+    _, _, out_blob_h, out_blob_w = predictions.shape
     orig_im_h, orig_im_w = original_im_shape
     resized_image_h, resized_image_w = resized_image_shape
+
+    if out_blob_w != out_blob_h:
+        print("WARNING: Invalid size of output blob. It sould be in NCHW layout and height should " \
+              "be equal to width. Current height = {}, current width = {}" \
+              "".format(out_blob_h, out_blob_w))
+        assert out_blob_w / out_blob_h == resized_image_w / resized_image_h
+
     objects = list()
-    size_normalizer = (resized_image_w, resized_image_h) if params.isYoloV3 else (params.side, params.side)
+    size_normalizer = (resized_image_w, resized_image_h) if params.isYoloV3 else (params.side_w, params.side_h)
     bbox_size = params.coords + 1 + params.classes
+    assert tuple(prediction.shape) == (1, params.num, params.side_h, params.side_w)
     # ------------------------------------------- Parsing YOLO Region output -------------------------------------------
-    for row, col, n in np.ndindex(params.side, params.side, params.num):
+    for row, col, n in np.ndindex(params.side_h, params.side_w, params.num):
         # Getting raw values for each detection bounding box
         bbox = predictions[0, n*bbox_size:(n+1)*bbox_size, row, col]
         x, y, width, height, object_probability = bbox[:5]
@@ -165,8 +173,11 @@ def parse_yolo_region(predictions, resized_image_shape, original_im_shape, param
         if object_probability < threshold:
             continue
         # Process raw value
-        x = (col + x) / params.side
-        y = (row + y) / params.side
+        x = (col + x) / params.side_w
+        if is_trained_on_square_images_run_on_nonsquare:
+            y = (row + y) / params.side_w #it should be so!
+        else:
+            y = (row + y) / params.side_h
         # Value for exp is very big number in some cases so following construction is using here
         try:
             width = exp(width)
@@ -175,14 +186,21 @@ def parse_yolo_region(predictions, resized_image_shape, original_im_shape, param
             continue
         # Depends on topology we need to normalize sizes by feature maps (up to YOLOv3) or by input shape (YOLOv3)
         width = width * params.anchors[2 * n] / size_normalizer[0]
-        height = height * params.anchors[2 * n + 1] / size_normalizer[1]
+        if is_trained_on_square_images_run_on_nonsquare:
+            height = height * params.anchors[2 * n + 1] / size_normalizer[0]
+        else:
+            height = height * params.anchors[2 * n + 1] / size_normalizer[1]
 
         class_id = np.argmax(class_probabilities)
         confidence = class_probabilities[class_id]*object_probability
         if confidence < threshold:
             continue
-        objects.append(scale_bbox(x=x, y=y, height=height, width=width, class_id=class_id, confidence=confidence,
-                                  im_h=orig_im_h, im_w=orig_im_w, is_proportional=is_proportional))
+        if is_trained_on_square_images_run_on_nonsquare:
+            objects.append(scale_bbox(x=x, y=y, height=height, width=width, class_id=class_id, confidence=confidence,
+                                      im_h=orig_im_w, im_w=orig_im_w, is_proportional=is_proportional))
+        else:
+            objects.append(scale_bbox(x=x, y=y, height=height, width=width, class_id=class_id, confidence=confidence,
+                                      im_h=orig_im_h, im_w=orig_im_w, is_proportional=is_proportional))
     return objects
 
 
@@ -226,14 +244,21 @@ def preprocess_frame(frame, input_height, input_width, nchw_shape, keep_aspect_r
     return in_frame
 
 
-def get_objects(output, net, new_frame_height_width, source_height_width, prob_threshold, is_proportional):
+def get_objects(output, net, new_frame_height_width, source_height_width, prob_threshold, is_proportional,
+                is_trained_on_square_images_run_on_nonsquare):
     objects = list()
 
     for layer_name, out_blob in output.items():
         out_blob = out_blob.buffer.reshape(net.layers[net.layers[layer_name].parents[0]].out_data[0].shape)
-        layer_params = YoloParams(net.layers[layer_name].params, out_blob.shape[2])
+        side_h = out_blob.shape[2]
+        side_w = out_blob.shape[3]
+        layer_params = YoloParams(net.layers[layer_name].params, side_w, side_h)
+        log.debug("layer_name={}, YoloParams=\n{}".format(
+                      layer_name,
+                      "\n".join("   {}: {}".format(k, v) for k, v in layer_params.__dict__.items())))
         objects += parse_yolo_region(out_blob, new_frame_height_width, source_height_width, layer_params,
-                                     prob_threshold, is_proportional)
+                                     prob_threshold, is_proportional,
+                                     is_trained_on_square_images_run_on_nonsquare)
 
     return objects
 
@@ -399,7 +424,8 @@ def main():
                 mode_info[mode.current].frames_count += 1
 
             objects = get_objects(output, net, (input_height, input_width), frame.shape[:-1], args.prob_threshold,
-                                  args.keep_aspect_ratio)
+                                  args.keep_aspect_ratio,
+                                  args.is_trained_on_square_images_run_on_nonsquare)
             objects = filter_objects(objects, args.iou_threshold, args.prob_threshold)
 
             if len(objects) and args.raw_output_message:
