@@ -29,11 +29,17 @@ import cv2
 import numpy as np
 from openvino.inference_engine import IECore
 
-sys.path.append(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'common'))
+sys.path.append(os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))), 'common'))
+print(sys.path)
 import monitors
 
+DEBUG = True
+if DEBUG:
+    log_level = logging.DEBUG
+else:
+    log_level = logging.INFO
 
-logging.basicConfig(format="[ %(levelname)s ] %(message)s", level=logging.INFO, stream=sys.stdout)
+logging.basicConfig(format="[ %(levelname)s ] %(message)s", level=log_level, stream=sys.stdout)
 log = logging.getLogger()
 
 def build_argparser():
@@ -75,8 +81,9 @@ def build_argparser():
                       help='Optional. List of monitors to show initially.')
     args.add_argument("--keep_aspect_ratio", action="store_true", default=False,
                       help='Optional. Keeps aspect ratio on resize.')
+    args.add_argument("--result_image_path", help="Optional. Path to dst result image to write.")
     args.add_argument("--is_trained_on_square_images_run_on_nonsquare", action="store_true", default=False,
-                      help='Optional. If the network was trained on square images and run on non-square.')
+                      help='Optional. If the network was trained on square images and run on non-square with width > height.')
     return parser
 
 
@@ -131,14 +138,40 @@ class ModeInfo():
         self.latency_sum = 0
 
 
-def scale_bbox(x, y, height, width, class_id, confidence, im_h, im_w, is_proportional):
+def scale_bbox(x, y, height, width, class_id, confidence, im_h, im_w,
+               resized_image_h, resized_image_w,
+               is_proportional,
+               is_trained_on_square_images_run_on_nonsquare):
     if is_proportional:
+        scale_x = resized_image_w / im_w
+        scale_y = resized_image_h / im_h
+        scale = min(scale_x, scale_y)
+        scale_x, scale_y = scale, scale
+        inner_img_w = scale * im_w
+        inner_img_h = scale * im_h
+        offset_x = (resized_img_w - inner_img_w) / 2.
+        offset_y = (resized_img_h - inner_img_h) / 2.
+    else:
+        scale_x = resized_image_w / im_w
+        scale_y = resized_image_h / im_h
+        offset_x = 0
+        offset_y = 0
+
         scale = np.array([min(im_w/im_h, 1), min(im_h/im_w, 1)])
         offset = 0.5*(np.ones(2) - scale)
         x, y = (np.array([x, y]) - offset) / scale
         width, height = np.array([width, height]) / scale
-    xmin = int((x - width / 2) * im_w)
-    ymin = int((y - height / 2) * im_h)
+
+    if is_trained_on_square_images_run_on_nonsquare:
+        coeff_x, coeff_y = im_w, im_w
+        offset_x /= resized_img_w
+        offset_y /= resized_img_w
+    else:
+        coeff_x, coeff_y = im_w, im_h
+
+
+    xmin = int((x - width / 2) * coeff_x)
+    ymin = int((y - height / 2) * coeff_y)
     xmax = int(xmin + width * im_w)
     ymax = int(ymin + height * im_h)
     # Method item() used here to convert NumPy types to native types for compatibility with functions, which don't
@@ -162,8 +195,12 @@ def parse_yolo_region(predictions, resized_image_shape, original_im_shape, param
 
     objects = list()
     size_normalizer = (resized_image_w, resized_image_h) if params.isYoloV3 else (params.side_w, params.side_h)
+    size_normalizer_x, size_normalizer_y = size_normalizer
     bbox_size = params.coords + 1 + params.classes
-    assert tuple(prediction.shape) == (1, params.num, params.side_h, params.side_w)
+    log.debug("bbox_size = {}".format(bbox_size))
+    log.debug("predictions.shape = {}".format(predictions.shape))
+    assert tuple(predictions.shape) == (1, params.num*bbox_size, params.side_h, params.side_w), (
+            "bbox_size={}, predictions.shape={}".format(bbox_size, predictions.shape))
     # ------------------------------------------- Parsing YOLO Region output -------------------------------------------
     for row, col, n in np.ndindex(params.side_h, params.side_w, params.num):
         # Getting raw values for each detection bounding box
@@ -185,22 +222,22 @@ def parse_yolo_region(predictions, resized_image_shape, original_im_shape, param
         except OverflowError:
             continue
         # Depends on topology we need to normalize sizes by feature maps (up to YOLOv3) or by input shape (YOLOv3)
-        width = width * params.anchors[2 * n] / size_normalizer[0]
+        width = width * params.anchors[2 * n] / size_normalizer_x
         if is_trained_on_square_images_run_on_nonsquare:
-            height = height * params.anchors[2 * n + 1] / size_normalizer[0]
+            height = height * params.anchors[2 * n + 1] / size_normalizer_x
         else:
-            height = height * params.anchors[2 * n + 1] / size_normalizer[1]
+            height = height * params.anchors[2 * n + 1] / size_normalizer_y
 
         class_id = np.argmax(class_probabilities)
         confidence = class_probabilities[class_id]*object_probability
         if confidence < threshold:
             continue
-        if is_trained_on_square_images_run_on_nonsquare:
-            objects.append(scale_bbox(x=x, y=y, height=height, width=width, class_id=class_id, confidence=confidence,
-                                      im_h=orig_im_w, im_w=orig_im_w, is_proportional=is_proportional))
-        else:
-            objects.append(scale_bbox(x=x, y=y, height=height, width=width, class_id=class_id, confidence=confidence,
-                                      im_h=orig_im_h, im_w=orig_im_w, is_proportional=is_proportional))
+
+        objects.append(scale_bbox(x=x, y=y, height=height, width=width, class_id=class_id, confidence=confidence,
+                                  im_h=orig_im_h, im_w=orig_im_w,
+                                  resized_image_h=resized_image_h, resized_image_w=resized_image_w,
+                                  is_proportional=is_proportional,
+                                  is_trained_on_square_images_run_on_nonsquare=is_trained_on_square_images_run_on_nonsquare))
     return objects
 
 
@@ -233,6 +270,10 @@ def resize(image, size, keep_aspect_ratio, interpolation=cv2.INTER_LINEAR):
     dx = (w-nw)//2
     dy = (h-nh)//2
     new_image[dy:dy+nh, dx:dx+nw, :] = image
+
+    if DEBUG:
+        cv2.imwrite("/tmp/tmp1_input.png", new_image)
+
     return new_image
 
 
@@ -373,6 +414,8 @@ def main():
         input_height, input_width = net.input_info[input_blob].input_data.shape[1:3]
         nchw_shape = False
 
+    log.debug("input_width = {}, input_height = {}, nchw_shape = {}".format(input_width, input_height, nchw_shape))
+
     if args.labels:
         with open(args.labels, 'r') as f:
             labels_map = [x.strip() for x in f]
@@ -439,10 +482,14 @@ def main():
                 obj['ymax'] = min(obj['ymax'], origin_im_size[0])
                 obj['xmin'] = max(obj['xmin'], 0)
                 obj['ymin'] = max(obj['ymin'], 0)
-                color = (min(obj['class_id'] * 12.5, 255),
-                         min(obj['class_id'] * 7, 255),
-                         min(obj['class_id'] * 5, 255))
-                det_label = labels_map[obj['class_id']] if labels_map and len(labels_map) >= obj['class_id'] else \
+#                color = (min(obj['class_id'] * 12.5, 255),
+#                         min(obj['class_id'] * 7, 255),
+#                         min(obj['class_id'] * 5, 255))
+                B = int(obj['class_id'] * 12.5 * 7*7*7*7 + 800) % 255
+                G = int(obj['class_id'] * 7    * 7*7*7*7 + 1024) % 255
+                R = int(obj['class_id'] * 5    * 7*7*7*7 + 11024) % 255
+                color = (B, G, R)
+                det_label = labels_map[obj['class_id']] + " [" + str(obj['class_id']) + "]" if labels_map and len(labels_map) >= obj['class_id'] else \
                     str(obj['class_id'])
 
                 if args.raw_output_message:
@@ -472,6 +519,8 @@ def main():
             put_highlighted_text(frame, mode_message, (10, int(origin_im_size[0] - 20)),
                                  cv2.FONT_HERSHEY_COMPLEX, 0.75, (10, 10, 200), 2)
 
+            if args.result_image_path:
+                cv2.imwrite(args.result_image_path, frame)
             if not args.no_show:
                 cv2.imshow("Detection Results", frame)
                 key = cv2.waitKey(wait_key_time)
